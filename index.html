@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RPG 傷害效益智算器 - 極簡高效益版</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              400: '#818cf8',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#312e81',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- React & Babel CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- FontAwesome CDN for Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+    .accordion-transition {
+      transition: max-height 0.3s ease-in-out, opacity 0.25s ease-in-out;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen antialiased selection:bg-brand-500 selection:text-white">
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect } = React;
+
+    // LocalStorage 檢測與安全存取 helper
+    const storageAvailable = () => {
+      try {
+        const x = '__storage_test__';
+        localStorage.setItem(x, x);
+        localStorage.removeItem(x);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const IS_STORAGE_OK = storageAvailable();
+
+    // 預設敵人情境基底
+    const DEFAULT_TARGET_PRESETS = [
+      {
+        id: 'std_boss',
+        name: '標準副本 Boss',
+        desc: '防禦 30,000 · 格擋 30% · 會抗 20%',
+        icon: 'fa-shield-halved',
+        enemyDef: 30000,
+        blockRate: 30,
+        critResist: 20,
+        blockResist: 50,
+        mitigation: 1.0
+      },
+      {
+        id: 'high_block_boss',
+        name: '高格擋/高防 Boss',
+        desc: '防禦 60,000 · 格擋 60% · 會抗 40%',
+        icon: 'fa-dragon',
+        enemyDef: 60000,
+        blockRate: 60,
+        critResist: 40,
+        blockResist: 60,
+        mitigation: 1.0
+      },
+      {
+        id: 'pvp_target',
+        name: 'PvP 玩家對決',
+        desc: '防禦 45,000 · 格擋 45% · 會抗 35%',
+        icon: 'fa-swords',
+        enemyDef: 45000,
+        blockRate: 45,
+        critResist: 35,
+        blockResist: 50,
+        mitigation: 0.8
+      }
+    ];
+
+    // 預設面板數據
+    const DEFAULT_INPUTS = {
+      // 主屬性
+      atk: '50000',
+      speed: '320',
+      critRate: '75',
+      critDmg: '220',
+      precision: '20',
+      // 次屬性 (預設值)
+      hp: '80000',
+      def: '4500',
+      dmgBonus: '45',
+      debuffDmgBonus: '30', // 負面增傷預設 30%
+      indepDmg: '0'
+    };
+
+    function calculateEV(stats, target) {
+      const atk = Math.max(0, parseFloat(stats.atk) || 0);
+      const critRate = Math.max(0, parseFloat(stats.critRate) || 0);
+      const critDmg = Math.max(0, parseFloat(stats.critDmg) || 0);
+      const precision = Math.max(0, parseFloat(stats.precision) || 0);
+      
+      const dmgBonus = Math.max(0, parseFloat(stats.dmgBonus) || 0);
+      const debuffDmgBonus = Math.max(0, parseFloat(stats.debuffDmgBonus) || 0);
+      const indepDmg = Math.max(0, parseFloat(stats.indepDmg) || 0);
+
+      const enemyDef = Math.max(0, parseFloat(target.enemyDef) || 0);
+      const mitigation = Math.max(0, target.mitigation !== undefined ? parseFloat(target.mitigation) : 1);
+
+      // 攻防對抗乘區 C = 攻擊力 / (攻擊力 + 敵人防禦力)
+      const bucketC = (atk + enemyDef) > 0 ? (atk / (atk + enemyDef)) : 1;
+
+      // 1. 實質機率計算 (圓桌理論)
+      const realCritRate = Math.min(1, Math.max(0, (critRate - target.critResist) / 100));
+      const realBlockRate = Math.min(1, Math.max(0, (target.blockRate - precision) / 100));
+
+      // 2. 倍率與保底
+      const critMult = Math.max(1.3, 1 + (critDmg - target.critResist) / 100);
+      const blockResistDenom = 1 + Math.max(0.5, (target.blockResist - precision) / 100);
+      const blockMult = 1 / blockResistDenom;
+
+      // 3. 圓桌 4 情境機率分佈 (被格擋時強制不觸發會心)
+      const pCritNoBlock = realCritRate * (1 - realBlockRate);
+      const pNoCritNoBlock = (1 - realCritRate) * (1 - realBlockRate);
+      const pNoCritBlock = realBlockRate;
+
+      // 4. 會心與格擋期望值乘區 (Bucket E)
+      const bucketE = (pCritNoBlock * critMult) + (pNoCritNoBlock * 1.0) + (pNoCritBlock * blockMult);
+
+      // 5. 增傷乘區 (包含常規增傷、負面增傷稀釋區、獨立增傷)
+      const bucketDmg = (1 + dmgBonus / 100) * (1 + debuffDmgBonus / 100) * (1 + indepDmg / 100);
+
+      // 6. 最終期望值 (EV)
+      const totalEV = atk * bucketC * bucketDmg * bucketE * mitigation;
+
+      return {
+        totalEV,
+        realCritRate: (realCritRate * 100).toFixed(1),
+        realBlockRate: (realBlockRate * 100).toFixed(1),
+        bucketC: bucketC.toFixed(3),
+        bucketE: bucketE.toFixed(3),
+        bucketDmg: bucketDmg.toFixed(3)
+      };
+    }
+
+    function App() {
+      // 本地儲存讀取 (LocalStorage persistence)
+      const [inputs, setInputs] = useState(() => {
+        if (!IS_STORAGE_OK) return DEFAULT_INPUTS;
+        try {
+          const saved = localStorage.getItem('rpg_calc_inputs_v4');
+          return saved ? { ...DEFAULT_INPUTS, ...JSON.parse(saved) } : DEFAULT_INPUTS;
+        } catch(e) {
+          return DEFAULT_INPUTS;
+        }
+      });
+
+      const [targetPresets, setTargetPresets] = useState(() => {
+        if (!IS_STORAGE_OK) return DEFAULT_TARGET_PRESETS;
+        try {
+          const saved = localStorage.getItem('rpg_calc_targets_v4');
+          return saved ? JSON.parse(saved) : DEFAULT_TARGET_PRESETS;
+        } catch(e) {
+          return DEFAULT_TARGET_PRESETS;
+        }
+      });
+
+      const [selectedPresetId, setSelectedPresetId] = useState(() => {
+        if (!IS_STORAGE_OK) return 'std_boss';
+        try {
+          return localStorage.getItem('rpg_calc_preset_id_v4') || 'std_boss';
+        } catch(e) {
+          return 'std_boss';
+        }
+      });
+
+      // 控制 UI 狀態
+      const [isSecondaryOpen, setIsSecondaryOpen] = useState(false);
+      const [isEditingTarget, setIsEditingTarget] = useState(false);
+      const [copiedToast, setCopiedToast] = useState(false);
+      const [showImportModal, setShowImportModal] = useState(false);
+      const [configCodeInput, setConfigCodeInput] = useState('');
+
+      // 持久化寫入 LocalStorage
+      useEffect(() => {
+        if (!IS_STORAGE_OK) return;
+        try {
+          localStorage.setItem('rpg_calc_inputs_v4', JSON.stringify(inputs));
+        } catch(e) {}
+      }, [inputs]);
+
+      useEffect(() => {
+        if (!IS_STORAGE_OK) return;
+        try {
+          localStorage.setItem('rpg_calc_targets_v4', JSON.stringify(targetPresets));
+        } catch(e) {}
+      }, [targetPresets]);
+
+      useEffect(() => {
+        if (!IS_STORAGE_OK) return;
+        try {
+          localStorage.setItem('rpg_calc_preset_id_v4', selectedPresetId);
+        } catch(e) {}
+      }, [selectedPresetId]);
+
+      // 當前選擇的敵人情境
+      const target = useMemo(() => {
+        return targetPresets.find(p => p.id === selectedPresetId) || targetPresets[0];
+      }, [selectedPresetId, targetPresets]);
+
+      // 輸入變更 Handler
+      const handleChange = (field, val) => {
+        setInputs(prev => ({ ...prev, [field]: val }));
+      };
+
+      // 修改對手屬性 Handler
+      const handleTargetFieldChange = (field, val) => {
+        const numVal = parseFloat(val) || 0;
+        setTargetPresets(prev => prev.map(p => {
+          if (p.id === selectedPresetId) {
+            return { ...p, [field]: numVal };
+          }
+          return p;
+        }));
+      };
+
+      // 重置對手屬性為預設值
+      const handleResetTarget = () => {
+        const defaultPreset = DEFAULT_TARGET_PRESETS.find(p => p.id === selectedPresetId);
+        if (defaultPreset) {
+          setTargetPresets(prev => prev.map(p => p.id === selectedPresetId ? { ...defaultPreset } : p));
+        }
+      };
+
+      // 重置所有輸入面板
+      const handleResetAllInputs = () => {
+        setInputs(DEFAULT_INPUTS);
+        setTargetPresets(DEFAULT_TARGET_PRESETS);
+        setSelectedPresetId('std_boss');
+      };
+
+      // 快速導出與匯入配置 JSON
+      const handleExportConfig = () => {
+        const configData = {
+          inputs,
+          targetPresets,
+          selectedPresetId
+        };
+        const jsonString = JSON.stringify(configData);
+        
+        const textarea = document.createElement('textarea');
+        textarea.value = jsonString;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+
+        setCopiedToast(true);
+        setTimeout(() => setCopiedToast(false), 2500);
+      };
+
+      const handleImportConfig = () => {
+        try {
+          const parsed = JSON.parse(configCodeInput.trim());
+          if (parsed.inputs) setInputs(parsed.inputs);
+          if (parsed.targetPresets) setTargetPresets(parsed.targetPresets);
+          if (parsed.selectedPresetId) setSelectedPresetId(parsed.selectedPresetId);
+          setShowImportModal(false);
+          setConfigCodeInput('');
+        } catch(e) {
+          alert('配置代碼格式錯誤，請確保貼上正確的 JSON 代碼');
+        }
+      };
+
+      const analysisResults = useMemo(() => {
+        const baseEVData = calculateEV(inputs, target);
+        const baseEV = baseEVData.totalEV;
+
+        if (baseEV <= 0) return { baseEVData, ranking: [] };
+
+        const currentSpeed = parseFloat(inputs.speed) || 0;
+        const currentHP = parseFloat(inputs.hp) || 0;
+        const currentDEF = parseFloat(inputs.def) || 0;
+
+        // 待測試詞條清單 (含負面增傷稀釋效益)
+        const candidates = [
+          {
+            name: '會心率 +15%, 精準 +15%',
+            category: '會精雙加',
+            icon: 'fa-crosshairs',
+            color: 'text-amber-400',
+            modStats: { 
+              critRate: (parseFloat(inputs.critRate) || 0) + 15,
+              precision: (parseFloat(inputs.precision) || 0) + 15 
+            },
+            desc: '同時提升會心率 15% 與精準 15% (抵銷敵人格擋)'
+          },
+          {
+            name: '會心率 +15%, 會心傷害 +23%',
+            category: '雙重會心',
+            icon: 'fa-bolt-lightning',
+            color: 'text-red-400',
+            modStats: { 
+              critRate: (parseFloat(inputs.critRate) || 0) + 15,
+              critDmg: (parseFloat(inputs.critDmg) || 0) + 23 
+            },
+            desc: '同時提升會心率 15% 與會心傷害 23%'
+          },
+          {
+            name: '負面增傷 +22.5%',
+            category: '獨立乘區',
+            icon: 'fa-skull-crossbones',
+            color: 'text-rose-400',
+            modStats: { debuffDmgBonus: (parseFloat(inputs.debuffDmgBonus) || 0) + 22.5 },
+            desc: `負面獨立乘區 (當前已有 ${inputs.debuffDmgBonus || 0}%，會隨之稀釋)`
+          },
+          {
+            name: '常規增傷 +15%',
+            category: '屬性增傷',
+            icon: 'fa-fire',
+            color: 'text-orange-400',
+            modStats: { dmgBonus: (parseFloat(inputs.dmgBonus) || 0) + 15 },
+            desc: '常規傷害加成 / 元素傷害加成'
+          },
+          {
+            name: `速轉攻 (+${(currentSpeed * 0.144).toFixed(0)} 攻擊)`,
+            category: '屬性轉化',
+            icon: 'fa-gauge-high',
+            color: 'text-cyan-400',
+            modStats: { atk: (parseFloat(inputs.atk) || 0) + (currentSpeed * 0.144) },
+            desc: `按當前速度 ${currentSpeed} × 14.4% 轉化攻擊`
+          },
+          {
+            name: `命轉攻 (+${(currentHP * 0.0225).toFixed(0)} 攻擊)`,
+            category: '屬性轉化',
+            icon: 'fa-heart-pulse',
+            color: 'text-emerald-400',
+            modStats: { atk: (parseFloat(inputs.atk) || 0) + (currentHP * 0.0225) },
+            desc: `按當前生命 ${currentHP} × 2.25% 轉化攻擊`
+          },
+          {
+            name: `防轉攻 (+${(currentDEF * 0.112).toFixed(0)} 攻擊)`,
+            category: '屬性轉化',
+            icon: 'fa-shield',
+            color: 'text-blue-400',
+            modStats: { atk: (parseFloat(inputs.atk) || 0) + (currentDEF * 0.112) },
+            desc: `按當前防禦 ${currentDEF} × 11.2% 轉化攻擊`
+          }
+        ];
+
+        // 計算每個詞條提升率
+        const ranking = candidates.map(item => {
+          const moddedInputs = { ...inputs, ...item.modStats };
+          const newEVData = calculateEV(moddedInputs, target);
+          const diffPct = ((newEVData.totalEV - baseEV) / baseEV) * 100;
+          return {
+            ...item,
+            newEV: newEVData.totalEV,
+            gainPct: diffPct
+          };
+        }).sort((a, b) => b.gainPct - a.gainPct);
+
+        return { baseEVData, ranking };
+      }, [inputs, target]);
+
+      const handleCopySummary = () => {
+        if (!analysisResults.ranking.length) return;
+        const top1 = analysisResults.ranking[0];
+        const top2 = analysisResults.ranking[1];
+        const top3 = analysisResults.ranking[2];
+
+        const text = `【RPG 傷害效益分析報告】
+對手情境：${target.name} (防禦:${target.enemyDef || 0} / 格擋:${target.blockRate}% / 會抗:${target.critResist}%)
+核心屬性：總攻:${inputs.atk} | 速度:${inputs.speed} | 會心/爆傷:${inputs.critRate}%/${inputs.critDmg}% | 精準:${inputs.precision}%
+次要屬性：負面增傷:${inputs.debuffDmgBonus}% | 常規增傷:${inputs.dmgBonus}%
+
+👑 最高效益詞條推薦 TOP 3：
+1. ${top1.name} ➔ 期望傷害提升 +${top1.gainPct.toFixed(2)}%
+2. ${top2.name} ➔ 期望傷害提升 +${top2.gainPct.toFixed(2)}%
+3. ${top3.name} ➔ 期望傷害提升 +${top3.gainPct.toFixed(2)}%`;
+
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+
+        setCopiedToast(true);
+        setTimeout(() => setCopiedToast(false), 2500);
+      };
+
+      return (
+        <div className="max-w-6xl mx-auto px-4 py-8">
+          {/* Header */}
+          <header className="text-center mb-8 relative">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-500/10 text-brand-400 text-xs font-semibold mb-3 border border-brand-500/20">
+              <i className="fa-solid fa-wand-magic-sparkles"></i> 智能演算法 · 
+              {IS_STORAGE_OK ? (
+                <span className="text-emerald-400"><i className="fa-solid fa-floppy-disk"></i> 已啟用自動紀錄</span>
+              ) : (
+                <span className="text-amber-400"><i className="fa-solid fa-triangle-exclamation"></i> 瀏覽器阻擋紀錄 (請用備份功能)</span>
+              )}
+            </div>
+            <h1 className="text-3xl md:text-4xl font-extrabold text-white tracking-tight mb-2">
+              RPG 傷害效益智算器
+            </h1>
+            <p className="text-slate-400 text-sm max-w-xl mx-auto mb-3">
+              填寫主屬性即可秒出最佳詞條排行榜。提供次屬性折疊區與對手屬性自訂功能。
+            </p>
+            
+            <div className="flex items-center justify-center gap-3 text-xs">
+              <button
+                onClick={handleExportConfig}
+                className="text-slate-400 hover:text-white transition-colors underline underline-offset-4 flex items-center gap-1"
+                title="複製當前配置為文字代碼"
+              >
+                <i className="fa-solid fa-download"></i> 複製備份碼
+              </button>
+              <span className="text-slate-700">|</span>
+              <button
+                onClick={() => setShowImportModal(true)}
+                className="text-slate-400 hover:text-white transition-colors underline underline-offset-4 flex items-center gap-1"
+                title="貼上備份碼恢復面板"
+              >
+                <i className="fa-solid fa-upload"></i> 貼上還原數據
+              </button>
+              <span className="text-slate-700">|</span>
+              <button
+                onClick={handleResetAllInputs}
+                title="重置所有數值為預設"
+                className="text-slate-500 hover:text-slate-300 transition-colors underline underline-offset-4 flex items-center gap-1"
+              >
+                <i className="fa-solid fa-rotate-left"></i> 重置預設
+              </button>
+            </div>
+          </header>
+
+          {/* 還原備份 Modal */}
+          {showImportModal && (
+            <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 max-w-md w-full shadow-2xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <i className="fa-solid fa-file-import text-brand-400"></i> 貼上數據代碼還原
+                  </h3>
+                  <button onClick={() => setShowImportModal(false)} className="text-slate-400 hover:text-white text-sm">
+                    <i className="fa-solid fa-xmark"></i>
+                  </button>
+                </div>
+                <textarea
+                  value={configCodeInput}
+                  onChange={e => setConfigCodeInput(e.target.value)}
+                  placeholder="請在此處貼上之前的備份 JSON 代碼..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-white font-mono h-32 focus:outline-none focus:border-brand-500"
+                ></textarea>
+                <div className="flex justify-end gap-2">
+                  <button
+                    onClick={() => setShowImportModal(false)}
+                    className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-300 text-xs hover:bg-slate-700"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={handleImportConfig}
+                    className="px-3 py-1.5 rounded-lg bg-brand-600 text-white text-xs font-semibold hover:bg-brand-500"
+                  >
+                    匯入還原
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Toast Notification */}
+          {copiedToast && (
+            <div className="fixed bottom-5 right-5 z-50 bg-emerald-600 text-white px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 text-sm font-medium animate-bounce">
+              <i className="fa-solid fa-circle-check"></i> 已複製到剪貼簿！
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            
+            {/* 左側：數據輸入面板 */}
+            <div className="lg:col-span-5 space-y-6">
+              
+              {/* 第一步：對手情境選擇 & 自訂 */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                    <i className="fa-solid fa-crosshairs text-brand-400"></i> 對手情境
+                  </h3>
+                  <button
+                    onClick={() => setIsEditingTarget(!isEditingTarget)}
+                    className={`text-xs px-2.5 py-1 rounded-lg border transition-all flex items-center gap-1.5 ${
+                      isEditingTarget 
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' 
+                        : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                    }`}
+                  >
+                    <i className={`fa-solid ${isEditingTarget ? 'fa-check' : 'fa-pen-to-square'}`}></i>
+                    {isEditingTarget ? '完成修改' : '修改對手屬性'}
+                  </button>
+                </div>
+
+                {/* 預設情境按鈕清單 */}
+                <div className="grid grid-cols-1 gap-2">
+                  {targetPresets.map(p => (
+                    <button
+                      key={p.id}
+                      onClick={() => setSelectedPresetId(p.id)}
+                      className={`flex items-center justify-between p-3 rounded-xl text-left border transition-all ${
+                        selectedPresetId === p.id
+                          ? 'bg-brand-600/20 border-brand-500 text-white shadow-md'
+                          : 'bg-slate-800/40 border-slate-700/60 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${selectedPresetId === p.id ? 'bg-brand-500 text-white' : 'bg-slate-700 text-slate-400'}`}>
+                          <i className={`fa-solid ${p.icon} text-sm`}></i>
+                        </div>
+                        <div>
+                          <div className="text-sm font-semibold flex items-center gap-2">
+                            {p.name}
+                          </div>
+                          <div className="text-xs text-slate-400">
+                            防禦 {p.enemyDef?.toLocaleString() || 0} · 格擋 {p.blockRate}% · 會抗 {p.critResist}%
+                          </div>
+                        </div>
+                      </div>
+                      {selectedPresetId === p.id && (
+                        <i className="fa-solid fa-circle-check text-brand-400"></i>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {/* 對手屬性修改展開區 */}
+                {isEditingTarget && (
+                  <div className="mt-4 pt-4 border-t border-slate-800 bg-slate-950/60 p-3.5 rounded-xl space-y-3">
+                    <div className="flex items-center justify-between text-xs text-amber-400 font-semibold mb-1">
+                      <span><i className="fa-solid fa-sliders"></i> 自訂當前對手數值 ({target.name})</span>
+                      <button onClick={handleResetTarget} className="text-[11px] text-slate-400 hover:text-white underline">
+                        重置此預設
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5 text-xs">
+                      <div>
+                        <label className="text-slate-400 block mb-1">敵人防禦力 (DEF)</label>
+                        <input
+                          type="number"
+                          value={target.enemyDef || 0}
+                          onChange={e => handleTargetFieldChange('enemyDef', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-slate-400 block mb-1">格擋率 (%)</label>
+                        <input
+                          type="number"
+                          value={target.blockRate}
+                          onChange={e => handleTargetFieldChange('blockRate', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-slate-400 block mb-1">會心抵抗 (%)</label>
+                        <input
+                          type="number"
+                          value={target.critResist}
+                          onChange={e => handleTargetFieldChange('critResist', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-slate-400 block mb-1">格擋抵抗 (%)</label>
+                        <input
+                          type="number"
+                          value={target.blockResist}
+                          onChange={e => handleTargetFieldChange('blockResist', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div className="col-span-2">
+                        <label className="text-slate-400 block mb-1">額外減傷/基礎係數 (0~1)</label>
+                        <input
+                          type="number"
+                          step="0.05"
+                          value={target.mitigation}
+                          onChange={e => handleTargetFieldChange('mitigation', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* 第二步：玩家角色屬性區塊 */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
+                
+                {/* 1. 主屬性區 (必填/常用) */}
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-xs font-bold text-brand-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <i className="fa-solid fa-star"></i> 主屬性區 (必要核心)
+                    </h3>
+                    <span className="text-[11px] text-slate-500">直接決定大部分收益</span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {/* 當前總攻擊力 */}
+                    <div>
+                      <label className="text-xs text-slate-200 font-semibold mb-1 block flex justify-between">
+                        <span>當前總攻擊力</span>
+                        <span className="text-slate-500 text-xs font-normal">Atk</span>
+                      </label>
+                      <input
+                        type="number"
+                        value={inputs.atk}
+                        onChange={e => handleChange('atk', e.target.value)}
+                        className="w-full bg-slate-800/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-medium focus:outline-none focus:border-brand-500 transition-colors shadow-inner"
+                        placeholder="例: 50000"
+                      />
+                    </div>
+
+                    {/* 速度 */}
+                    <div>
+                      <label className="text-xs text-slate-200 font-semibold mb-1 block flex justify-between">
+                        <span>當前速度 (用作速轉攻)</span>
+                        <span className="text-slate-500 text-xs font-normal">Speed</span>
+                      </label>
+                      <input
+                        type="number"
+                        value={inputs.speed}
+                        onChange={e => handleChange('speed', e.target.value)}
+                        className="w-full bg-slate-800/90 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white font-medium focus:outline-none focus:border-brand-500 transition-colors shadow-inner"
+                        placeholder="例: 320"
+                      />
+                    </div>
+
+                    {/* 會心率 / 會心傷害 / 精準 (併排) */}
+                    <div className="grid grid-cols-3 gap-2 pt-1">
+                      <div>
+                        <label className="text-[11px] text-slate-300 font-medium mb-1 block">會心率 (%)</label>
+                        <input
+                          type="number"
+                          value={inputs.critRate}
+                          onChange={e => handleChange('critRate', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 font-medium mb-1 block">會心傷害 (%)</label>
+                        <input
+                          type="number"
+                          value={inputs.critDmg}
+                          onChange={e => handleChange('critDmg', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 font-medium mb-1 block">精準 (%)</label>
+                        <input
+                          type="number"
+                          value={inputs.precision}
+                          onChange={e => handleChange('precision', e.target.value)}
+                          className="w-full bg-slate-800 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 分隔線 */}
+                <div className="h-px bg-slate-800/80 my-2"></div>
+
+                {/* 2. 次屬性區 (預設關閉/可展開) */}
+                <div>
+                  <button
+                    onClick={() => setIsSecondaryOpen(!isSecondaryOpen)}
+                    className="w-full flex items-center justify-between p-2.5 rounded-xl bg-slate-800/40 hover:bg-slate-800/80 border border-slate-700/60 transition-all text-left"
+                  >
+                    <div className="flex items-center gap-2">
+                      <i className={`fa-solid fa-sliders text-xs text-indigo-400`}></i>
+                      <span className="text-xs font-semibold text-slate-300">次屬性設定區 (進階/預設)</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-slate-500 hidden sm:inline">
+                        負面增傷: {inputs.debuffDmgBonus || 0}%
+                      </span>
+                      <i className={`fa-solid fa-chevron-down text-xs text-slate-400 transition-transform duration-200 ${isSecondaryOpen ? 'rotate-180' : ''}`}></i>
+                    </div>
+                  </button>
+
+                  {/* 折疊面板內容 */}
+                  {isSecondaryOpen && (
+                    <div className="mt-3 p-3 bg-slate-950/50 rounded-xl border border-slate-800 space-y-3 animate-fadeIn">
+                      
+                      {/* 生命與防禦 (命轉攻/防轉攻) */}
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[11px] text-slate-400 mb-1 block">當前總生命 (HP)</label>
+                          <input
+                            type="number"
+                            value={inputs.hp}
+                            onChange={e => handleChange('hp', e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] text-slate-400 mb-1 block">當前總防禦 (DEF)</label>
+                          <input
+                            type="number"
+                            value={inputs.def}
+                            onChange={e => handleChange('def', e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                          />
+                        </div>
+                      </div>
+
+                      {/* 增傷乘區 (常規增傷 / 負面增傷 / 獨立增傷) */}
+                      <div className="space-y-2 pt-1 border-t border-slate-800/80">
+                        <div>
+                          <label className="text-[11px] text-rose-300 font-medium mb-1 block flex justify-between">
+                            <span>當前負面增傷 (%)</span>
+                            <span className="text-slate-500 text-[10px]">幾條負面增傷會互相稀釋</span>
+                          </label>
+                          <input
+                            type="number"
+                            value={inputs.debuffDmgBonus}
+                            onChange={e => handleChange('debuffDmgBonus', e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                            placeholder="預設 30%"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="text-[11px] text-slate-400 mb-1 block">當前常規增傷 (%)</label>
+                            <input
+                              type="number"
+                              value={inputs.dmgBonus}
+                              onChange={e => handleChange('dmgBonus', e.target.value)}
+                              className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] text-slate-400 mb-1 block">當前獨立增傷 (%)</label>
+                            <input
+                              type="number"
+                              value={inputs.indepDmg}
+                              onChange={e => handleChange('indepDmg', e.target.value)}
+                              className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                    </div>
+                  )}
+                </div>
+
+              </div>
+
+              {/* 機率實時狀態數據 */}
+              <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-4 text-xs text-slate-400 space-y-2">
+                <div className="flex justify-between">
+                  <span>攻防對抗乘區 C [攻/(攻+防)]:</span>
+                  <span className="text-slate-200 font-semibold">{analysisResults.baseEVData.bucketC} ({(parseFloat(analysisResults.baseEVData.bucketC)*100).toFixed(1)}%)</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>對抗後實質會心率:</span>
+                  <span className="text-slate-200 font-semibold">{analysisResults.baseEVData.realCritRate}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>對抗後實質被格擋率:</span>
+                  <span className="text-slate-200 font-semibold">{analysisResults.baseEVData.realBlockRate}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>總增傷加成倍率 (含負面與獨立):</span>
+                  <span className="text-slate-200 font-semibold">{analysisResults.baseEVData.bucketDmg}x</span>
+                </div>
+              </div>
+
+            </div>
+
+            {/* 右側：分析結果與排行榜 */}
+            {}
+            <div className="lg:col-span-7 space-y-6">
+              
+              {/* 分析結果頂部 Header */}
+              <div className="bg-gradient-to-r from-slate-900 via-slate-900 to-indigo-950/40 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div>
+                  <div className="text-xs text-brand-400 font-bold uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                    <i className="fa-solid fa-chart-line"></i> 分析完成 · 最高收益方案
+                  </div>
+                  <h2 className="text-xl font-bold text-white">
+                    {analysisResults.ranking.length > 0 ? (
+                      <span>首選詞條：<span className="text-amber-400">{analysisResults.ranking[0].name}</span></span>
+                    ) : '請輸入有效的數據'}
+                  </h2>
+                </div>
+                <button
+                  onClick={handleCopySummary}
+                  className="bg-brand-600 hover:bg-brand-500 text-white px-4 py-2.5 rounded-xl text-xs font-semibold shadow-lg transition-all flex items-center gap-2 whitespace-nowrap active:scale-95"
+                >
+                  <i className="fa-solid fa-copy"></i> 複製簡報
+                </button>
+              </div>
+
+              {/* 詞條效益排行榜清單 */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <i className="fa-solid fa-trophy text-amber-400"></i> 單詞條效益提升排行榜 (ROI)
+                  </h3>
+                  <span className="text-xs text-slate-500">均傷 (EV) 增幅 %</span>
+                </div>
+
+                <div className="space-y-3">
+                  {analysisResults.ranking.map((item, index) => {
+                    const isTop1 = index === 0;
+                    const maxGain = analysisResults.ranking[0]?.gainPct || 1;
+                    const barWidth = Math.max(5, (item.gainPct / maxGain) * 100);
+
+                    return (
+                      <div
+                        key={item.name}
+                        className={`p-3.5 rounded-xl border transition-all ${
+                          isTop1
+                            ? 'bg-amber-500/10 border-amber-500/40 text-white shadow-lg'
+                            : 'bg-slate-800/40 border-slate-700/50 text-slate-300 hover:bg-slate-800/70'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-3">
+                            {/* 排名 Badge */}
+                            <div className={`w-6 h-6 rounded-full flex items-center justify-center font-bold text-xs ${
+                              index === 0 ? 'bg-amber-400 text-slate-950' :
+                              index === 1 ? 'bg-slate-300 text-slate-950' :
+                              index === 2 ? 'bg-amber-700 text-white' : 'bg-slate-800 text-slate-400'
+                            }`}>
+                              {index === 0 ? <i className="fa-solid fa-crown text-xs"></i> : index + 1}
+                            </div>
+
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className={`font-bold text-sm ${isTop1 ? 'text-amber-300' : 'text-slate-100'}`}>
+                                  {item.name}
+                                </span>
+                                <span className={`text-[10px] px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700 ${item.color}`}>
+                                  {item.category}
+                                </span>
+                              </div>
+                              <div className="text-[11px] text-slate-400 mt-0.5">{item.desc}</div>
+                            </div>
+                          </div>
+
+                          {/* 提升百分比 */}
+                          <div className="text-right">
+                            <span className={`text-base font-extrabold ${isTop1 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                              +{item.gainPct.toFixed(2)}%
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* 進度條 */}
+                        <div className="w-full bg-slate-950/60 h-2 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              isTop1 ? 'bg-gradient-to-r from-amber-500 to-yellow-300' : 'bg-brand-500'
+                            }`}
+                            style={{ width: `${barWidth}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 智算分析小結 */}
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 text-xs text-slate-300 space-y-2">
+                <div className="font-bold text-slate-200 flex items-center gap-2 mb-1">
+                  <i className="fa-solid fa-lightbulb text-amber-400"></i> 機制效益解析：
+                </div>
+                {analysisResults.ranking[0] && (
+                  <p className="leading-relaxed">
+                    在目前面板下，投資 <span className="text-amber-300 font-semibold">{analysisResults.ranking[0].name}</span> 的收益最高（邊際增幅 +{analysisResults.ranking[0].gainPct.toFixed(2)}%）。
+                    {parseFloat(inputs.precision) < target.blockRate 
+                      ? ' 敵人的格擋率高於你的精準，提高精準能有效消除被格擋造成的顯著減傷。' 
+                      : ' 當前屬性分佈均勻，轉換屬性或獨立乘區展現了出色的效益。'}
+                  </p>
+                )}
+              </div>
+
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
