@@ -113,11 +113,19 @@
       def: '4500',
       dmgBonus: '45',
       debuffDmgBonus: '30', // 負面增傷預設 30%
-      indepDmg: '0'
+      indepDmg: '0',
+      flatDilution: '50' // 白值/固定傷害佔比 (預設 50% 稀釋)
     };
 
-    function calculateEV(stats, target) {
+    function calculateEV(stats, target, baseAtk = null) {
       const atk = Math.max(0, parseFloat(stats.atk) || 0);
+      const refAtk = baseAtk !== null ? baseAtk : atk;
+      const flatDilution = Math.min(99, Math.max(0, parseFloat(stats.flatDilution) || 0));
+      
+      // 計算考慮白值稀釋後的實質基礎傷害攻擊力當量
+      const deltaAtk = atk - refAtk;
+      const effAtk = refAtk + deltaAtk * (1 - flatDilution / 100);
+
       const critRate = Math.max(0, parseFloat(stats.critRate) || 0);
       const critDmg = Math.max(0, parseFloat(stats.critDmg) || 0);
       const precision = Math.max(0, parseFloat(stats.precision) || 0);
@@ -152,8 +160,8 @@
       // 5. 增傷乘區 (包含常規增傷、負面增傷稀釋區、獨立增傷)
       const bucketDmg = (1 + dmgBonus / 100) * (1 + debuffDmgBonus / 100) * (1 + indepDmg / 100);
 
-      // 6. 最終期望值 (EV)
-      const totalEV = atk * bucketC * bucketDmg * bucketE * mitigation;
+      // 6. 最終期望值 (EV)，引入白值稀釋後的 effAtk
+      const totalEV = effAtk * bucketC * bucketDmg * bucketE * mitigation;
 
       return {
         totalEV,
@@ -295,7 +303,8 @@
       };
 
       const analysisResults = useMemo(() => {
-        const baseEVData = calculateEV(inputs, target);
+        const baseAtkNum = parseFloat(inputs.atk) || 0;
+        const baseEVData = calculateEV(inputs, target, baseAtkNum);
         const baseEV = baseEVData.totalEV;
 
         if (baseEV <= 0) return { baseEVData, ranking: [] };
@@ -373,7 +382,7 @@
         // 計算每個詞條提升率
         const ranking = candidates.map(item => {
           const moddedInputs = { ...inputs, ...item.modStats };
-          const newEVData = calculateEV(moddedInputs, target);
+          const newEVData = calculateEV(moddedInputs, target, baseAtkNum);
           const diffPct = ((newEVData.totalEV - baseEV) / baseEV) * 100;
           return {
             ...item,
@@ -710,7 +719,7 @@
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-slate-500 hidden sm:inline">
-                        負面增傷: {inputs.debuffDmgBonus || 0}%
+                        負面增傷: {inputs.debuffDmgBonus || 0}% | 白值稀釋: {inputs.flatDilution || 50}%
                       </span>
                       <i className={`fa-solid fa-chevron-down text-xs text-slate-400 transition-transform duration-200 ${isSecondaryOpen ? 'rotate-180' : ''}`}></i>
                     </div>
@@ -777,6 +786,21 @@
                               className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
                             />
                           </div>
+                        </div>
+
+                        {/* 白值/固定傷害稀釋區 */}
+                        <div>
+                          <label className="text-[11px] text-amber-300 font-medium mb-1 block flex justify-between">
+                            <span>白值/固定傷害佔比 (%)</span>
+                            <span className="text-slate-500 text-[10px]">預設 50% 代表攻擊效益稀釋打5折</span>
+                          </label>
+                          <input
+                            type="number"
+                            value={inputs.flatDilution}
+                            onChange={e => handleChange('flatDilution', e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-brand-500"
+                            placeholder="預設 50"
+                          />
                         </div>
                       </div>
 
